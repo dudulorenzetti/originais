@@ -1,14 +1,30 @@
 const STORAGE_KEY = "originais_lumine_state_v2";
+const STORAGE_FALLBACK_KEYS = [
+  `${STORAGE_KEY}_backup`,
+  "originais_lumine_state_v1",
+  "originais_lumine_state",
+  "base44_app_state"
+];
 
 const CONFIG_META = {
-  categories: "Categorias",
-  productionTypes: "Tipos de Produção",
-  formats: "Formatos",
-  natures: "Naturezas",
-  durations: "Durações",
-  statuses: "Status",
-  stages: "Etapas"
+  stages: "ETAPA",
+  categories: "CATEGORIA",
+  formats: "FORMATO",
+  natures: "NATUREZA",
+  durations: "DURAÇÃO",
+  statuses: "STATUS"
 };
+
+const CONFIG_SINGULAR_META = {
+  stages: "Etapa",
+  categories: "Categoria",
+  formats: "Formato",
+  natures: "Natureza",
+  durations: "Duração",
+  statuses: "Status"
+};
+
+const COLOR_CONFIG_KEYS = new Set(["categories", "formats", "natures", "statuses"]);
 
 const STATUS_COLORS = {
   Backlog: "gray",
@@ -33,8 +49,31 @@ const BASE44_FILES = [
 
 let state = loadState();
 let currentTab = "dashboard";
-let selectedDashboardYear = "Todos";
-let selectedConfigKey = "categories";
+let selectedDashboardYears = new Set();
+let dashboardFiltersOpen = false;
+let selectedDashboardFilters = {
+  categories: new Set(),
+  formats: new Set(),
+  natures: new Set(),
+  durations: new Set()
+};
+let selectedGanttYears = new Set();
+let ganttFiltersOpen = false;
+let selectedGanttFilters = {
+  categories: new Set(),
+  formats: new Set(),
+  natures: new Set(),
+  durations: new Set()
+};
+let selectedProjectYears = new Set();
+let projectFiltersOpen = false;
+let selectedProjectFilters = {
+  categories: new Set(),
+  formats: new Set(),
+  natures: new Set(),
+  durations: new Set()
+};
+let selectedConfigKey = "stages";
 let selectedStageRef = null;
 let draggingStage = null;
 let suppressLineClickUntil = 0;
@@ -79,15 +118,18 @@ function bindGlobalActions() {
       alert("Período inválido.");
       return;
     }
-    state.timeline = { start, end };
+    state.timeline.start = start;
+    state.timeline.end = end;
+    state.timeline.monthsShown = monthToIndex(end) - monthToIndex(start) + 1;
     saveState();
     renderGantt();
   });
-  document.getElementById("timelineBack").addEventListener("click", () => shiftTimeline(-6));
-  document.getElementById("timelineForward").addEventListener("click", () => shiftTimeline(6));
+  document.getElementById("timelineBack").addEventListener("click", decreaseTimelineWindow);
+  document.getElementById("timelineForward").addEventListener("click", increaseTimelineWindow);
+  document.getElementById("timelineLeft").addEventListener("click", () => panTimeline(-1));
+  document.getElementById("timelineRight").addEventListener("click", () => panTimeline(1));
 
   document.getElementById("projectSearch").addEventListener("input", renderProjectsTable);
-  document.getElementById("projectStatusFilter").addEventListener("change", renderProjectsTable);
 
   document.getElementById("btnImportCsv").addEventListener("click", () => {
     document.getElementById("csvInput").click();
@@ -96,6 +138,19 @@ function bindGlobalActions() {
   document.getElementById("csvInput").addEventListener("change", importCsvFile);
 
   document.getElementById("btnAddConfig").addEventListener("click", addConfigItem);
+  document.getElementById("dashboardFiltersToggle").addEventListener("click", () => {
+    dashboardFiltersOpen = !dashboardFiltersOpen;
+    renderDashboard();
+  });
+  document.getElementById("btnFilterGantt").addEventListener("click", () => {
+    ganttFiltersOpen = !ganttFiltersOpen;
+    renderGantt();
+  });
+  document.getElementById("btnFilterProjects").addEventListener("click", () => {
+    projectFiltersOpen = !projectFiltersOpen;
+    renderProjectsTools();
+    renderProjectsTable();
+  });
 }
 
 function bindDialog() {
@@ -103,6 +158,8 @@ function bindDialog() {
   const form = document.getElementById("projectForm");
   const stageDialog = document.getElementById("stageDialog");
   const stageForm = document.getElementById("stageForm");
+  const configItemDialog = document.getElementById("configItemDialog");
+  const configItemForm = document.getElementById("configItemForm");
 
   document.getElementById("btnCancelDialog").addEventListener("click", () => dialog.close());
 
@@ -123,6 +180,7 @@ function bindDialog() {
   form.addEventListener("submit", (e) => {
     e.preventDefault();
     const project = collectProjectForm();
+    if (!project) return;
     const idx = state.projects.findIndex((p) => p.id === project.id);
     if (idx >= 0) state.projects[idx] = project;
     else state.projects.push(project);
@@ -175,6 +233,13 @@ function bindDialog() {
     stageDialog.close();
     renderAll();
   });
+
+  document.getElementById("configItemCancelBtn").addEventListener("click", () => configItemDialog.close());
+  configItemForm.addEventListener("submit", (e) => {
+    e.preventDefault();
+    saveConfigItemDialog();
+    configItemDialog.close();
+  });
 }
 
 function renderAll() {
@@ -188,71 +253,186 @@ function renderAll() {
 
 function renderDashboard() {
   renderDashboardYearChips();
+  renderDashboardExtraFilters();
   const allProjects = [...state.projects];
   const projects = filteredDashboardProjects();
 
   const totalProjects = allProjects.length;
-  const projectsWithSpent = projects.filter((p) => hasNumericValue(p.spent) || hasNumericValue(p.budget));
-  const totalSpent = projectsWithSpent.reduce((acc, p) => acc + Number(p.spent ?? p.budget ?? 0), 0);
+  const projectsWithSpent = projects
+    .map((p) => ({ p, value: getProjectSpentValue(p) }))
+    .filter((item) => item.value !== null);
+  const totalSpent = projectsWithSpent.reduce((acc, item) => acc + item.value, 0);
   const avgSpent = projectsWithSpent.length ? totalSpent / projectsWithSpent.length : 0;
 
   document.getElementById("summaryCards").innerHTML = [
-    cardHtml("Total de Produções", String(totalProjects)),
-    cardHtml("Total Gasto", money(totalSpent)),
-    cardHtml("Gasto Médio por Projeto", money(avgSpent))
+    cardHtml("Total de Produções", String(totalProjects), "projects"),
+    cardHtml("Total Gasto", money(totalSpent), "spent"),
+    cardHtml("Gasto Médio por Projeto", money(avgSpent), "avg")
   ].join("");
 
-  renderBarChart(document.getElementById("chartByYear"), countBy(projects, (p) => String(p.year), true), "vertical", ["#f3ba00"]);
-  renderBarChart(document.getElementById("chartByStatus"), countBy(projects, (p) => p.status, true), "vertical", ["#10b981", "#3b82f6", "#f59e0b", "#94a3b8"]);
-  renderDonutChart(document.getElementById("chartByCategory"), countBy(projects, (p) => p.category, true));
-  renderBarChart(document.getElementById("chartByNature"), countBy(projects, (p) => p.nature, true), "vertical", ["#10b981", "#3b82f6", "#f59e0b"]);
-  renderBarChart(document.getElementById("chartByDuration"), countBy(projects, (p) => p.duration, true), "vertical", ["#10b981", "#3b82f6", "#f59e0b"]);
+  renderBarChart(document.getElementById("chartByYear"), countBy(projects, (p) => getProjectYear(p), true), "vertical", ["#f3ba00"]);
+  renderBarChart(document.getElementById("chartByStatus"), countBy(projects, (p) => getProjectField(p, "status"), true), "vertical", ["#10b981", "#3b82f6", "#f59e0b", "#94a3b8"]);
+  renderBarChart(document.getElementById("chartByCategory"), countBy(projects, (p) => getProjectField(p, "category"), true), "vertical", ["#10b981", "#3b82f6", "#f59e0b", "#94a3b8"]);
+  renderBarChart(document.getElementById("chartByFormat"), countBy(projects, (p) => getProjectField(p, "format"), true), "vertical", ["#10b981", "#3b82f6", "#f59e0b"]);
+  renderBarChart(document.getElementById("chartByNature"), countBy(projects, (p) => getProjectField(p, "nature"), true), "vertical", ["#10b981", "#3b82f6", "#f59e0b"]);
+  renderBarChart(document.getElementById("chartByDuration"), countBy(projects, (p) => getProjectField(p, "duration"), true), "vertical", ["#10b981", "#3b82f6", "#f59e0b"]);
   renderBarChart(document.getElementById("chartAvgStage"), avgMonthsByStage(projects), "horizontal", ["#94a3b8", "#60a5fa", "#fcd34d", "#34d399", "#f472b6"]);
 }
 
 function renderDashboardYearChips() {
-  const years = [...new Set(state.projects.map((p) => Number(p.year)).filter((y) => y > 0))].sort((a, b) => a - b);
+  const years = [...new Set(state.projects.map((p) => getProjectYear(p)).filter((y) => y > 0))].sort((a, b) => a - b);
+  const allActive = selectedDashboardYears.size === 0;
   const chips = ["Todos", ...years];
   document.getElementById("yearChips").innerHTML = chips
-    .map((y) => `<button class="chip ${String(y) === String(selectedDashboardYear) ? "active" : ""}" data-year="${y}">${y}</button>`)
+    .map((y) => {
+      const active = y === "Todos" ? allActive : selectedDashboardYears.has(String(y));
+      const value = y === "Todos" ? "__all" : String(y);
+      return `<button class="chip ${active ? "active" : ""}" data-year="${value}">${y}</button>`;
+    })
     .join("");
 
   document.querySelectorAll("#yearChips .chip").forEach((chip) => {
     chip.addEventListener("click", () => {
-      selectedDashboardYear = chip.dataset.year;
+      if (chip.dataset.year === "__all") {
+        selectedDashboardYears.clear();
+      } else {
+        const y = chip.dataset.year;
+        if (selectedDashboardYears.has(y)) selectedDashboardYears.delete(y);
+        else selectedDashboardYears.add(y);
+      }
       renderDashboard();
     });
   });
 }
 
 function filteredDashboardProjects() {
-  const withYear = state.projects.filter((p) => Number(p.year) > 0);
-  if (selectedDashboardYear === "Todos") return withYear;
-  return withYear.filter((p) => String(p.year) === String(selectedDashboardYear));
+  const withYear = state.projects.filter((p) => getProjectYear(p) > 0);
+  return withYear.filter((p) => {
+    if (selectedDashboardYears.size && !selectedDashboardYears.has(String(getProjectYear(p)))) return false;
+    if (!matchesMultiFilter(getProjectField(p, "category"), selectedDashboardFilters.categories)) return false;
+    if (!matchesMultiFilter(getProjectField(p, "format"), selectedDashboardFilters.formats)) return false;
+    if (!matchesMultiFilter(getProjectField(p, "nature"), selectedDashboardFilters.natures)) return false;
+    if (!matchesMultiFilter(getProjectField(p, "duration"), selectedDashboardFilters.durations)) return false;
+    return true;
+  });
+}
+
+function renderDashboardExtraFilters() {
+  const panel = document.getElementById("dashboardFiltersPanel");
+  const toggle = document.getElementById("dashboardFiltersToggle");
+  panel.hidden = !dashboardFiltersOpen;
+  toggle.innerHTML = `Filtros <span class="filter-arrow">${dashboardFiltersOpen ? "▴" : "▾"}</span>`;
+
+  renderDashboardFilterChips(
+    document.getElementById("dashboardCategoryChips"),
+    uniq([...state.settings.categories, ...state.projects.map((p) => getProjectField(p, "category"))]).filter(Boolean),
+    selectedDashboardFilters.categories,
+    "categories"
+  );
+  renderDashboardFilterChips(
+    document.getElementById("dashboardFormatChips"),
+    uniq([...state.settings.formats, ...state.projects.map((p) => getProjectField(p, "format"))]).filter(Boolean),
+    selectedDashboardFilters.formats,
+    "formats"
+  );
+  renderDashboardFilterChips(
+    document.getElementById("dashboardNatureChips"),
+    uniq([...state.settings.natures, ...state.projects.map((p) => getProjectField(p, "nature"))]).filter(Boolean),
+    selectedDashboardFilters.natures,
+    "natures"
+  );
+  renderDashboardFilterChips(
+    document.getElementById("dashboardDurationChips"),
+    uniq([...state.settings.durations, ...state.projects.map((p) => getProjectField(p, "duration"))]).filter(Boolean),
+    selectedDashboardFilters.durations,
+    "durations"
+  );
+}
+
+function renderDashboardFilterChips(container, values, selectedSet, key, onChange = renderDashboard) {
+  const allActive = selectedSet.size === 0;
+  container.innerHTML = [
+    `<button class="chip ${allActive ? "active" : ""}" data-filter-key="${key}" data-filter-value="__all">Todos</button>`,
+    ...values.map((value) => `<button class="chip ${selectedSet.has(value) ? "active" : ""}" data-filter-key="${key}" data-filter-value="${encodeURIComponent(value)}">${escapeHtml(value)}</button>`)
+  ].join("");
+
+  container.querySelectorAll(".chip").forEach((chip) => {
+    chip.addEventListener("click", () => {
+      const filterValue = chip.dataset.filterValue === "__all" ? "__all" : decodeURIComponent(chip.dataset.filterValue);
+      const set = selectedSet;
+      if (filterValue === "__all") {
+        set.clear();
+      } else if (set.has(filterValue)) {
+        set.delete(filterValue);
+      } else {
+        set.add(filterValue);
+      }
+      onChange();
+    });
+  });
+}
+
+function matchesMultiFilter(value, selectedSet) {
+  if (!selectedSet || selectedSet.size === 0) return true;
+  const normalized = String(value || "").trim();
+  return normalized && selectedSet.has(normalized);
+}
+
+function getProjectField(project, field) {
+  const pick = (...keys) => {
+    for (const key of keys) {
+      const value = project?.[key];
+      if (value !== null && value !== undefined && String(value).trim() !== "") return String(value).trim();
+    }
+    return "";
+  };
+
+  if (field === "category") return pick("category", "categoria");
+  if (field === "format") return pick("format", "formato", "productionType", "production_type");
+  if (field === "nature") return pick("nature", "natureza");
+  if (field === "duration") return pick("duration", "duracao");
+  if (field === "status") return pick("status");
+  return pick(field);
+}
+
+function getProjectYear(project) {
+  const normalizedReleaseDate = inferReleaseDate(project);
+  if (!normalizedReleaseDate) return null;
+  return Number(normalizedReleaseDate.slice(0, 4));
 }
 
 function renderGantt() {
+  renderGanttYearChips();
+  renderGanttExtraFilters();
+  normalizeTimelineWindow();
   document.getElementById("timelineStart").value = state.timeline.start;
   document.getElementById("timelineEnd").value = state.timeline.end;
-  renderTimelineYearChips();
 
   const months = monthsBetween(state.timeline.start, state.timeline.end);
-  const list = sortedProjects();
+  const list = sortedProjects(filteredGanttProjects(), "desc");
   const container = document.getElementById("ganttContainer");
+  const rangeLabel = document.getElementById("timelineRangeLabel");
+  if (rangeLabel) rangeLabel.textContent = timelineRangeLabel(state.timeline.start, state.timeline.end);
 
   if (!months.length) {
     container.innerHTML = '<div class="empty">Período inválido.</div>';
     return;
   }
 
-  let html = '<div class="gantt">';
-  html += '<div class="gantt-head">';
+  const leftWidth = 270;
+  const availableWidth = Math.max(container.clientWidth - leftWidth - 8, 320);
+  const monthWidth = Math.max(38, Math.floor(availableWidth / months.length));
+  const timelineWidth = months.length * monthWidth;
+  container.style.setProperty("--month-width", `${monthWidth}px`);
+
+  let html = `<div class="gantt" style="min-width:${leftWidth + timelineWidth}px">`;
+  html += `<div class="gantt-head" style="grid-template-columns:${leftWidth}px ${timelineWidth}px">`;
   html += '<div class="g-left">PROJETO</div>';
   html += `<div class="g-months">${months.map((m) => `<div class="g-month">${monthLabel(m)}</div>`).join("")}</div>`;
   html += "</div>";
 
   list.forEach((project) => {
-    html += '<div class="gantt-row">';
+    html += `<div class="gantt-row" style="grid-template-columns:${leftWidth}px ${timelineWidth}px">`;
     html += `<div class="g-left">
       <button class="g-open" data-open-project="${project.id}">
         <span class="g-code">${escapeHtml(project.code || "")}</span>
@@ -279,6 +459,16 @@ function renderGantt() {
         <span class="stage-handle right" data-resize="right"></span>
       </div>`;
     });
+
+    const releaseMarker = getReleaseMarkerData(project.releaseDate, state.timeline.start, state.timeline.end);
+    if (releaseMarker) {
+      html += `<div class="release-marker" style="left: calc(${releaseMarker.offsetMonths.toFixed(4)} * var(--month-width));" title="Lançamento: ${escapeHtml(
+        releaseMarker.label
+      )}">
+        <span class="release-dot"></span>
+        <small>${escapeHtml(releaseMarker.short)}</small>
+      </div>`;
+    }
     html += "</div></div>";
   });
 
@@ -326,6 +516,79 @@ function renderTimelineYearChips() {
   document.getElementById("timelineYears").innerHTML = years.map((y) => `<span class="chip active">${y}</span>`).join("");
 }
 
+function renderGanttYearChips() {
+  const years = [...new Set(state.projects.map((p) => getProjectYear(p)).filter((y) => y > 0))].sort((a, b) => a - b);
+  const allActive = selectedGanttYears.size === 0;
+  const chips = ["Todos", ...years];
+  document.getElementById("timelineYears").innerHTML = chips
+    .map((y) => {
+      const active = y === "Todos" ? allActive : selectedGanttYears.has(String(y));
+      const value = y === "Todos" ? "__all" : String(y);
+      return `<button class="chip ${active ? "active" : ""}" data-gyear="${value}">${y}</button>`;
+    })
+    .join("");
+
+  document.querySelectorAll("#timelineYears .chip").forEach((chip) => {
+    chip.addEventListener("click", () => {
+      if (chip.dataset.gyear === "__all") {
+        selectedGanttYears.clear();
+      } else {
+        const y = chip.dataset.gyear;
+        if (selectedGanttYears.has(y)) selectedGanttYears.delete(y);
+        else selectedGanttYears.add(y);
+      }
+      renderGantt();
+    });
+  });
+}
+
+function renderGanttExtraFilters() {
+  const panel = document.getElementById("ganttFiltersPanel");
+  const toggle = document.getElementById("btnFilterGantt");
+  panel.hidden = !ganttFiltersOpen;
+  toggle.innerHTML = `Filtros <span class="filter-arrow">${ganttFiltersOpen ? "▴" : "▾"}</span>`;
+
+  renderDashboardFilterChips(
+    document.getElementById("ganttCategoryChips"),
+    uniq([...state.settings.categories, ...state.projects.map((p) => getProjectField(p, "category"))]).filter(Boolean),
+    selectedGanttFilters.categories,
+    "categories",
+    () => renderGantt()
+  );
+  renderDashboardFilterChips(
+    document.getElementById("ganttFormatChips"),
+    uniq([...state.settings.formats, ...state.projects.map((p) => getProjectField(p, "format"))]).filter(Boolean),
+    selectedGanttFilters.formats,
+    "formats",
+    () => renderGantt()
+  );
+  renderDashboardFilterChips(
+    document.getElementById("ganttNatureChips"),
+    uniq([...state.settings.natures, ...state.projects.map((p) => getProjectField(p, "nature"))]).filter(Boolean),
+    selectedGanttFilters.natures,
+    "natures",
+    () => renderGantt()
+  );
+  renderDashboardFilterChips(
+    document.getElementById("ganttDurationChips"),
+    uniq([...state.settings.durations, ...state.projects.map((p) => getProjectField(p, "duration"))]).filter(Boolean),
+    selectedGanttFilters.durations,
+    "durations",
+    () => renderGantt()
+  );
+}
+
+function filteredGanttProjects() {
+  return state.projects.filter((p) => {
+    if (selectedGanttYears.size && !selectedGanttYears.has(String(getProjectYear(p)))) return false;
+    if (!matchesMultiFilter(getProjectField(p, "category"), selectedGanttFilters.categories)) return false;
+    if (!matchesMultiFilter(getProjectField(p, "format"), selectedGanttFilters.formats)) return false;
+    if (!matchesMultiFilter(getProjectField(p, "nature"), selectedGanttFilters.natures)) return false;
+    if (!matchesMultiFilter(getProjectField(p, "duration"), selectedGanttFilters.durations)) return false;
+    return true;
+  });
+}
+
 function openStageDialog(projectId, stageId = null, forcedStart = null) {
   const project = state.projects.find((p) => p.id === projectId);
   if (!project) return;
@@ -355,7 +618,7 @@ function startStageDrag(event, bar, mode) {
   const project = state.projects.find((p) => p.id === projectId);
   const stage = project?.stages.find((s) => s.id === stageId);
   if (!stage) return;
-  const monthWidth = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--month-width")) || 46;
+  const monthWidth = parseFloat(getComputedStyle(document.getElementById("ganttContainer")).getPropertyValue("--month-width")) || 46;
   draggingStage = {
     projectId,
     stageId,
@@ -403,7 +666,7 @@ function onStageDragEnd() {
 
 function monthIndexFromLinePointer(line, event) {
   const rect = line.getBoundingClientRect();
-  const monthWidth = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--month-width")) || 46;
+  const monthWidth = parseFloat(getComputedStyle(document.getElementById("ganttContainer")).getPropertyValue("--month-width")) || 46;
   const x = event.clientX - rect.left;
   const idx = Math.floor(x / monthWidth);
   const max = monthsBetween(state.timeline.start, state.timeline.end).length - 1;
@@ -421,13 +684,35 @@ function renderStageGhost(line, event) {
     line.appendChild(ghost);
   }
   ghost.style.left = `calc(${idx} * var(--month-width))`;
+  ghost.textContent = monthHoverLabel(addMonths(state.timeline.start, idx));
 }
 
 function removeStageGhost(line) {
   line.querySelector(".stage-ghost")?.remove();
 }
 
-function shiftTimeline(delta) {
+function zoomTimeline(delta) {
+  normalizeTimelineWindow();
+  const current = getTimelineMonthsShown();
+  const next = Math.max(6, Math.min(72, current + delta));
+  state.timeline.monthsShown = next;
+  state.timeline.end = addMonths(state.timeline.start, next - 1);
+  document.getElementById("timelineStart").value = state.timeline.start;
+  document.getElementById("timelineEnd").value = state.timeline.end;
+  saveState();
+  renderGantt();
+}
+
+function decreaseTimelineWindow() {
+  zoomTimeline(6);
+}
+
+function increaseTimelineWindow() {
+  zoomTimeline(-6);
+}
+
+function panTimeline(delta) {
+  normalizeTimelineWindow();
   state.timeline.start = addMonths(state.timeline.start, delta);
   state.timeline.end = addMonths(state.timeline.end, delta);
   document.getElementById("timelineStart").value = state.timeline.start;
@@ -437,41 +722,117 @@ function shiftTimeline(delta) {
 }
 
 function renderProjectsTools() {
-  const select = document.getElementById("projectStatusFilter");
-  const statuses = ["Todos", ...uniq(state.settings.statuses).filter(Boolean)];
-  const current = select.value || "Todos";
-  select.innerHTML = statuses.map((s) => `<option ${s === current ? "selected" : ""}>${escapeHtml(s)}</option>`).join("");
+  const panel = document.getElementById("projectFiltersPanel");
+  const toggle = document.getElementById("btnFilterProjects");
+  panel.hidden = !projectFiltersOpen;
+  toggle.innerHTML = `Filtros <span class="filter-arrow">${projectFiltersOpen ? "▴" : "▾"}</span>`;
+
+  const years = [...new Set(state.projects.map((p) => getProjectYear(p)).filter((y) => y > 0))].sort((a, b) => a - b);
+  const allActive = selectedProjectYears.size === 0;
+  document.getElementById("projectYears").innerHTML = ["Todos", ...years]
+    .map((year) => {
+      const active = year === "Todos" ? allActive : selectedProjectYears.has(String(year));
+      const value = year === "Todos" ? "__all" : String(year);
+      return `<button class="chip ${active ? "active" : ""}" data-pyear="${value}">${year}</button>`;
+    })
+    .join("");
+
+  document.querySelectorAll("#projectYears .chip").forEach((chip) => {
+    chip.addEventListener("click", () => {
+      if (chip.dataset.pyear === "__all") selectedProjectYears.clear();
+      else if (selectedProjectYears.has(chip.dataset.pyear)) selectedProjectYears.delete(chip.dataset.pyear);
+      else selectedProjectYears.add(chip.dataset.pyear);
+      renderProjectsTable();
+      renderProjectsTools();
+    });
+  });
+
+  renderDashboardFilterChips(
+    document.getElementById("projectCategoryChips"),
+    uniq([...state.settings.categories, ...state.projects.map((p) => getProjectField(p, "category"))]).filter(Boolean),
+    selectedProjectFilters.categories,
+    "categories",
+    () => {
+      renderProjectsTools();
+      renderProjectsTable();
+    }
+  );
+  renderDashboardFilterChips(
+    document.getElementById("projectFormatChips"),
+    uniq([...state.settings.formats, ...state.projects.map((p) => getProjectField(p, "format"))]).filter(Boolean),
+    selectedProjectFilters.formats,
+    "formats",
+    () => {
+      renderProjectsTools();
+      renderProjectsTable();
+    }
+  );
+  renderDashboardFilterChips(
+    document.getElementById("projectNatureChips"),
+    uniq([...state.settings.natures, ...state.projects.map((p) => getProjectField(p, "nature"))]).filter(Boolean),
+    selectedProjectFilters.natures,
+    "natures",
+    () => {
+      renderProjectsTools();
+      renderProjectsTable();
+    }
+  );
+  renderDashboardFilterChips(
+    document.getElementById("projectDurationChips"),
+    uniq([...state.settings.durations, ...state.projects.map((p) => getProjectField(p, "duration"))]).filter(Boolean),
+    selectedProjectFilters.durations,
+    "durations",
+    () => {
+      renderProjectsTools();
+      renderProjectsTable();
+    }
+  );
 }
 
 function renderProjectsTable() {
   const query = document.getElementById("projectSearch").value.trim().toLowerCase();
-  const status = document.getElementById("projectStatusFilter").value || "Todos";
 
-  const projects = sortedProjects().filter((p) => {
+  const projects = sortedProjects(state.projects, "desc").filter((p) => {
     const hit = !query || String(p.title || "").toLowerCase().includes(query) || String(p.code || "").toLowerCase().includes(query);
-    const okStatus = status === "Todos" || p.status === status;
-    return hit && okStatus;
+    if (!hit) return false;
+    if (selectedProjectYears.size && !selectedProjectYears.has(String(getProjectYear(p)))) return false;
+    if (!matchesMultiFilter(getProjectField(p, "category"), selectedProjectFilters.categories)) return false;
+    if (!matchesMultiFilter(getProjectField(p, "format"), selectedProjectFilters.formats)) return false;
+    if (!matchesMultiFilter(getProjectField(p, "nature"), selectedProjectFilters.natures)) return false;
+    if (!matchesMultiFilter(getProjectField(p, "duration"), selectedProjectFilters.durations)) return false;
+    return true;
   });
 
   const body = document.getElementById("projectsTableBody");
   if (!projects.length) {
-    body.innerHTML = '<tr><td colspan="7" class="empty">Nenhum projeto encontrado.</td></tr>';
+    body.innerHTML = '<tr><td colspan="9" class="empty">Nenhum projeto encontrado.</td></tr>';
     return;
   }
+
+  const categories = uniq(state.settings.categories).filter(Boolean);
+  const formats = uniq(state.settings.formats).filter(Boolean);
+  const natures = uniq(state.settings.natures).filter(Boolean);
+  const statuses = uniq(state.settings.statuses).filter(Boolean);
 
   body.innerHTML = projects
     .map((p) => {
       const badgeClass = STATUS_COLORS[p.status] || "gray";
       return `<tr>
-        <td>${escapeHtml(p.code)}</td>
-        <td><strong>${escapeHtml(p.title)}</strong></td>
-        <td>${escapeHtml(p.category || "-")}</td>
-        <td>${escapeHtml(p.format || p.productionType || "-")} ${p.nature ? `<small>· ${escapeHtml(p.nature)}</small>` : ""}</td>
-        <td>${(p.spent || p.budget) ? money(Number(p.spent || p.budget)) : "-"}</td>
-        <td>${p.status ? `<span class="badge ${badgeClass}">${escapeHtml(p.status)}</span>` : ""}</td>
+        <td><button class="btn light cell-link-edit" data-action="edit" data-id="${p.id}">${escapeHtml(p.code || "")}</button></td>
+        <td><button class="btn light cell-link-edit" data-action="edit" data-id="${p.id}">${escapeHtml(p.title || "")}</button></td>
+        <td>${inlineSelect("category", p.id, getProjectField(p, "category"), categories)}</td>
+        <td>${inlineSelect("format", p.id, getProjectField(p, "format"), formats)}</td>
+        <td>${inlineSelect("nature", p.id, getProjectField(p, "nature"), natures)}</td>
+        <td><input class="cell-inline-input" data-action="inline-budget" data-id="${p.id}" type="number" min="0" step="0.01" value="${p.budget ?? p.spent ?? ""}" placeholder="R$" /></td>
+        <td><input class="cell-inline-input" data-action="inline-release-date" data-id="${p.id}" type="text" inputmode="numeric" placeholder="dd/mm/aaaa" maxlength="10" value="${formatDatePtBr(p.releaseDate || "")}" /></td>
+        <td>${inlineSelect("status", p.id, getProjectField(p, "status"), statuses, badgeClass)}</td>
         <td>
-          <button class="btn light" data-action="edit" data-id="${p.id}">Editar</button>
-          <button class="btn danger" data-action="del" data-id="${p.id}">Excluir</button>
+          <button class="btn light icon-btn" data-action="edit" data-id="${p.id}" title="Editar projeto" aria-label="Editar projeto">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 17.25V21h3.75L17.8 9.94l-3.75-3.75L3 17.25zm2.92 2.33H5v-.92l9.06-9.06.92.92L5.92 19.58zM20.71 7.04a1 1 0 0 0 0-1.41L18.37 3.3a1 1 0 0 0-1.41 0l-1.54 1.54 3.75 3.75 1.54-1.55z"/></svg>
+          </button>
+          <button class="btn danger icon-btn" data-action="del" data-id="${p.id}" title="Excluir projeto" aria-label="Excluir projeto">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3h6l1 2h5v2H3V5h5l1-2zm1 6h2v9h-2V9zm4 0h2v9h-2V9zM7 9h2v9H7V9zm-1 12h12a2 2 0 0 0 2-2V8H4v11a2 2 0 0 0 2 2z"/></svg>
+          </button>
         </td>
       </tr>`;
     })
@@ -479,6 +840,55 @@ function renderProjectsTable() {
 
   body.querySelectorAll("button[data-action='edit']").forEach((btn) => {
     btn.addEventListener("click", () => openProjectDialog(btn.dataset.id));
+  });
+
+  body.querySelectorAll("select[data-action='inline-select']").forEach((el) => {
+    el.addEventListener("change", () => {
+      const project = state.projects.find((p) => p.id === el.dataset.id);
+      if (!project) return;
+      const field = el.dataset.field;
+      if (field === "category") project.category = el.value;
+      if (field === "format") project.format = el.value;
+      if (field === "nature") project.nature = el.value;
+      if (field === "status") project.status = el.value;
+      saveState();
+      renderProjectsTable();
+      renderDashboard();
+      renderGantt();
+    });
+  });
+
+  body.querySelectorAll("input[data-action='inline-budget']").forEach((el) => {
+    el.addEventListener("change", () => {
+      const project = state.projects.find((p) => p.id === el.dataset.id);
+      if (!project) return;
+      const value = el.value.trim();
+      project.budget = value === "" ? null : Number(value);
+      saveState();
+      renderProjectsTable();
+      renderDashboard();
+    });
+  });
+
+  body.querySelectorAll("input[data-action='inline-release-date']").forEach((el) => {
+    el.addEventListener("change", () => {
+      const project = state.projects.find((p) => p.id === el.dataset.id);
+      if (!project) return;
+      const raw = String(el.value || "").trim();
+      const normalized = normalizeDateInput(raw);
+      if (raw && !normalized) {
+        alert("Data inválida. Use o formato dd/mm/aaaa.");
+        renderProjectsTable();
+        return;
+      }
+      project.releaseDate = normalized;
+      project.year = normalized ? Number(normalized.slice(0, 4)) : null;
+      saveState();
+      renderProjectsTable();
+      renderGantt();
+      renderDashboard();
+      renderProjectsTools();
+    });
   });
 
   body.querySelectorAll("button[data-action='del']").forEach((btn) => {
@@ -496,7 +906,6 @@ function openProjectDialog(projectId = null) {
   const dialog = document.getElementById("projectDialog");
 
   fillSelect("projectCategory", state.settings.categories, project?.category);
-  fillSelect("projectProductionType", state.settings.productionTypes, project?.productionType);
   fillSelect("projectFormat", state.settings.formats, project?.format);
   fillSelect("projectNature", state.settings.natures, project?.nature);
   fillSelect("projectDuration", state.settings.durations, project?.duration);
@@ -508,8 +917,8 @@ function openProjectDialog(projectId = null) {
   document.getElementById("projectId").value = project?.id || uid();
   document.getElementById("projectCode").value = project?.code || nextCode();
   document.getElementById("projectTitle").value = project?.title || "";
-  document.getElementById("projectYear").value = project?.year || "";
-  document.getElementById("projectBudget").value = project?.budget || "";
+  document.getElementById("projectBudget").value = project?.budget ?? "";
+  document.getElementById("projectReleaseDate").value = formatDatePtBr(project?.releaseDate || "");
   document.getElementById("projectNotes").value = project?.notes || "";
 
   const stageWrap = document.getElementById("projectStages");
@@ -530,8 +939,15 @@ function openProjectDialog(projectId = null) {
 }
 
 function collectProjectForm() {
+  const projectId = document.getElementById("projectId").value;
+  const existingProject = state.projects.find((project) => project.id === projectId);
   const rawBudget = document.getElementById("projectBudget").value.trim();
-  const rawYear = document.getElementById("projectYear").value.trim();
+  const rawReleaseDate = document.getElementById("projectReleaseDate").value.trim();
+  const normalizedReleaseDate = normalizeDateInput(rawReleaseDate);
+  if (rawReleaseDate && !normalizedReleaseDate) {
+    alert("Data de lançamento inválida. Use o formato dd/mm/aaaa.");
+    return null;
+  }
   const stages = [...document.querySelectorAll("#projectStages .stage-row")]
     .map((row) => {
       const stageId = row.querySelector('[data-field="stageId"]').value;
@@ -548,17 +964,18 @@ function collectProjectForm() {
     .filter(Boolean);
 
   return {
-    id: document.getElementById("projectId").value,
+    id: projectId,
     code: document.getElementById("projectCode").value.trim(),
     title: document.getElementById("projectTitle").value.trim(),
-    year: rawYear === "" ? null : Number(rawYear),
+    year: normalizedReleaseDate ? Number(normalizedReleaseDate.slice(0, 4)) : null,
     category: document.getElementById("projectCategory").value,
-    productionType: document.getElementById("projectProductionType").value,
+    productionType: existingProject?.productionType || "",
     format: document.getElementById("projectFormat").value,
     nature: document.getElementById("projectNature").value,
     duration: document.getElementById("projectDuration").value,
     status: document.getElementById("projectStatus").value,
     budget: rawBudget === "" ? null : Number(rawBudget),
+    releaseDate: normalizedReleaseDate,
     spent: null,
     notes: document.getElementById("projectNotes").value.trim(),
     stages
@@ -583,10 +1000,11 @@ function buildStageRow(stage = null) {
 }
 
 function renderConfigTabs() {
+  if (!CONFIG_META[selectedConfigKey]) selectedConfigKey = Object.keys(CONFIG_META)[0];
   const tabs = Object.entries(CONFIG_META);
   const el = document.getElementById("configTabs");
   el.innerHTML = tabs
-    .map(([key, label]) => `<button class="chip ${selectedConfigKey === key ? "active" : ""}" data-key="${key}">${label}</button>`)
+    .map(([key, label]) => `<button class="chip config-tab-chip ${selectedConfigKey === key ? "active" : ""}" data-key="${key}">${label}</button>`)
     .join("");
 
   el.querySelectorAll(".chip").forEach((chip) => {
@@ -605,10 +1023,13 @@ function renderConfigList() {
   if (selectedConfigKey === "stages") {
     list.innerHTML = state.settings.stages
       .map(
-        (item) => `<li class="config-item">
-      <span>${escapeHtml(item.name)}</span>
+        (item, index) => `<li class="config-item" data-config-index="${index}" data-config-id="${item.id}">
+      <span class="config-item-main">
+        <button type="button" class="btn light config-drag-btn" draggable="true" title="Arrastar para ordenar" aria-label="Arrastar para ordenar">⋮⋮</button>
+        <span class="config-item-label">${escapeHtml(item.name)}</span>
+      </span>
       <span class="actions">
-        <input type="color" value="${item.color}" data-action="color" data-id="${item.id}" />
+        <input class="config-color-input" type="color" value="${item.color}" data-action="color" data-id="${item.id}" />
         <button class="btn light" data-action="edit" data-id="${item.id}">Editar</button>
         <button class="btn danger" data-action="del" data-id="${item.id}">Excluir</button>
       </span>
@@ -616,12 +1037,21 @@ function renderConfigList() {
       )
       .join("");
   } else {
-    const arr = state.settings[selectedConfigKey];
+    const hasColor = COLOR_CONFIG_KEYS.has(selectedConfigKey);
+    const arr = state.settings[selectedConfigKey] || [];
     list.innerHTML = arr
       .map(
-        (item, i) => `<li class="config-item">
-      <span>${escapeHtml(item)}</span>
+        (item, i) => `<li class="config-item" data-config-index="${i}" data-config-id="${i}">
+      <span class="config-item-main">
+        <button type="button" class="btn light config-drag-btn" draggable="true" title="Arrastar para ordenar" aria-label="Arrastar para ordenar">⋮⋮</button>
+        <span class="config-item-label">${escapeHtml(item)}</span>
+      </span>
       <span class="actions">
+        ${
+          hasColor
+            ? `<input class="config-color-input" type="color" value="${getConfigItemColor(selectedConfigKey, item, i)}" data-action="item-color" data-id="${i}" />`
+            : ""
+        }
         <button class="btn light" data-action="edit" data-id="${i}">Editar</button>
         <button class="btn danger" data-action="del" data-id="${i}">Excluir</button>
       </span>
@@ -650,6 +1080,19 @@ function renderConfigList() {
       renderConfigList();
     });
   });
+
+  list.querySelectorAll("input[data-action='item-color']").forEach((input) => {
+    input.addEventListener("change", () => {
+      const idx = Number(input.dataset.id);
+      const item = state.settings[selectedConfigKey]?.[idx];
+      if (!item) return;
+      setConfigItemColor(selectedConfigKey, item, input.value);
+      saveState();
+      renderAll();
+    });
+  });
+
+  initConfigDragAndDrop(list);
 }
 
 function addConfigItem() {
@@ -658,31 +1101,21 @@ function addConfigItem() {
     if (!name || !name.trim()) return;
     state.settings.stages.push({ id: uid(), name: name.trim(), color: randomColor() });
   } else {
-    const label = CONFIG_META[selectedConfigKey].slice(0, -1);
+    const label = CONFIG_SINGULAR_META[selectedConfigKey];
     const value = prompt(`Novo ${label}:`);
     if (!value || !value.trim()) return;
-    state.settings[selectedConfigKey].push(value.trim());
+    const nextValue = value.trim();
+    state.settings[selectedConfigKey].push(nextValue);
+    if (COLOR_CONFIG_KEYS.has(selectedConfigKey)) {
+      setConfigItemColor(selectedConfigKey, nextValue, getConfigItemColor(selectedConfigKey, nextValue, state.settings[selectedConfigKey].length - 1));
+    }
   }
   saveState();
   renderAll();
 }
 
 function editConfigItem(id) {
-  if (selectedConfigKey === "stages") {
-    const stage = state.settings.stages.find((s) => s.id === id);
-    if (!stage) return;
-    const next = prompt("Novo nome da etapa:", stage.name);
-    if (!next || !next.trim()) return;
-    stage.name = next.trim();
-  } else {
-    const arr = state.settings[selectedConfigKey];
-    const current = arr[Number(id)];
-    const next = prompt("Novo valor:", current);
-    if (!next || !next.trim()) return;
-    arr[Number(id)] = next.trim();
-  }
-  saveState();
-  renderAll();
+  openConfigItemDialog(id);
 }
 
 function deleteConfigItem(id) {
@@ -693,10 +1126,130 @@ function deleteConfigItem(id) {
       p.stages = p.stages.filter((st) => st.stageId !== id);
     });
   } else {
-    state.settings[selectedConfigKey].splice(Number(id), 1);
+    const arr = state.settings[selectedConfigKey];
+    const removed = arr[Number(id)];
+    arr.splice(Number(id), 1);
+    if (COLOR_CONFIG_KEYS.has(selectedConfigKey)) {
+      deleteConfigItemColor(selectedConfigKey, removed);
+    }
   }
   saveState();
   renderAll();
+}
+
+function isColorEnabledConfigKey(key) {
+  return key === "stages" || COLOR_CONFIG_KEYS.has(key);
+}
+
+function openConfigItemDialog(id) {
+  const key = selectedConfigKey;
+  const dialog = document.getElementById("configItemDialog");
+  const title = document.getElementById("configItemDialogTitle");
+  const nameInput = document.getElementById("configItemName");
+  const colorInput = document.getElementById("configItemColor");
+  const colorWrap = document.getElementById("configItemColorWrap");
+
+  let currentName = "";
+  let currentColor = randomColor();
+
+  if (key === "stages") {
+    const stage = state.settings.stages.find((item) => item.id === id);
+    if (!stage) return;
+    currentName = stage.name;
+    currentColor = stage.color || randomColor();
+  } else {
+    const idx = Number(id);
+    const item = state.settings[key]?.[idx];
+    if (!item) return;
+    currentName = item;
+    currentColor = getConfigItemColor(key, item, idx);
+  }
+
+  title.textContent = `Editar ${CONFIG_META[key]}`;
+  document.getElementById("configItemKey").value = key;
+  document.getElementById("configItemId").value = id;
+  nameInput.value = currentName;
+  colorWrap.hidden = !isColorEnabledConfigKey(key);
+  colorInput.value = currentColor;
+  dialog.showModal();
+}
+
+function saveConfigItemDialog() {
+  const key = document.getElementById("configItemKey").value;
+  const id = document.getElementById("configItemId").value;
+  const nameInput = document.getElementById("configItemName");
+  const colorInput = document.getElementById("configItemColor");
+  const nextName = String(nameInput.value || "").trim();
+  if (!nextName) return;
+
+  const nextColor = normalizeHexColor(colorInput.value) || randomColor();
+  const hasColor = isColorEnabledConfigKey(key);
+
+  if (key === "stages") {
+    const stage = state.settings.stages.find((item) => item.id === id);
+    if (!stage) return;
+    stage.name = nextName;
+    if (hasColor) stage.color = nextColor;
+  } else {
+    const arr = state.settings[key] || [];
+    const idx = Number(id);
+    const current = arr[idx];
+    if (!current) return;
+    arr[idx] = nextName;
+    if (hasColor) {
+      if (current !== nextName) renameConfigItemColor(key, current, nextName, idx);
+      setConfigItemColor(key, nextName, nextColor);
+    }
+  }
+
+  saveState();
+  renderAll();
+}
+
+function initConfigDragAndDrop(list) {
+  let draggedIndex = null;
+  const rows = [...list.querySelectorAll(".config-item")];
+  rows.forEach((row) => {
+    const handle = row.querySelector(".config-drag-btn");
+    if (!handle) return;
+
+    handle.addEventListener("dragstart", (event) => {
+      draggedIndex = Number(row.dataset.configIndex);
+      row.classList.add("dragging");
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("text/plain", String(draggedIndex));
+    });
+
+    handle.addEventListener("dragend", () => {
+      draggedIndex = null;
+      rows.forEach((item) => item.classList.remove("drag-over", "dragging"));
+    });
+
+    row.addEventListener("dragover", (event) => {
+      if (draggedIndex === null) return;
+      event.preventDefault();
+      row.classList.add("drag-over");
+      event.dataTransfer.dropEffect = "move";
+    });
+
+    row.addEventListener("dragleave", () => {
+      row.classList.remove("drag-over");
+    });
+
+    row.addEventListener("drop", (event) => {
+      if (draggedIndex === null) return;
+      event.preventDefault();
+      row.classList.remove("drag-over");
+      const targetIndex = Number(row.dataset.configIndex);
+      if (!Number.isInteger(targetIndex) || targetIndex < 0 || targetIndex === draggedIndex) return;
+
+      if (selectedConfigKey === "stages") moveArrayItem(state.settings.stages, draggedIndex, targetIndex);
+      else moveArrayItem(state.settings[selectedConfigKey], draggedIndex, targetIndex);
+
+      saveState();
+      renderAll();
+    });
+  });
 }
 
 function importCsvFile(event) {
@@ -781,6 +1334,10 @@ function importSimpleProjectCsv(text) {
       duration: row.duracao || state.settings.durations[0],
       status: row.status || "",
       budget: row.gasto || row.budget ? Number(row.gasto || row.budget) : null,
+      releaseDate: inferReleaseDate({
+        releaseDate: row.data_de_lancamento || row.data_lancamento || row.release_date || row.release_date_at || "",
+        year: row.ano || row.year || ""
+      }),
       spent: row.spent ? Number(row.spent) : null,
       notes: row.notas || "",
       stages: []
@@ -868,6 +1425,10 @@ function buildStateFromBase44Exports(fileMap, fallbackState) {
       duration: row.duration || "",
       status: row.status || "",
       budget: row.budget ? Number(row.budget) : null,
+      releaseDate: inferReleaseDate({
+        releaseDate: row.release_date || row.data_de_lancamento || "",
+        year: row.year || ""
+      }),
       spent: row.spent ? Number(row.spent) : null,
       notes: row.notes || "",
       description: row.description || "",
@@ -885,6 +1446,12 @@ function buildStateFromBase44Exports(fileMap, fallbackState) {
     statuses: uniq([...pickName(statusRows), ...projects.map((p) => p.status)]),
     stages: stages.length ? stages : fallbackState.settings.stages
   };
+  settings.itemColors = mergeItemColors(buildDefaultItemColors(settings), {
+    categories: buildItemColorMap(categoryRows, settings.categories, DEFAULT_ITEM_COLOR_PALETTES.categories),
+    formats: buildItemColorMap(formatRows, settings.formats, DEFAULT_ITEM_COLOR_PALETTES.formats),
+    natures: buildItemColorMap(natureRows, settings.natures, DEFAULT_ITEM_COLOR_PALETTES.natures),
+    statuses: buildItemColorMap(statusRows, settings.statuses, DEFAULT_ITEM_COLOR_PALETTES.statuses)
+  });
 
   const timeline = defaultTimelineWindow();
 
@@ -966,6 +1533,68 @@ function monthFromDate(date) {
   return value.slice(0, 7);
 }
 
+function isValidDateIso(value) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(value || ""))) return false;
+  const [year, month, day] = String(value).split("-").map(Number);
+  const probe = new Date(Date.UTC(year, month - 1, day));
+  return probe.getUTCFullYear() === year && probe.getUTCMonth() === month - 1 && probe.getUTCDate() === day;
+}
+
+function normalizeDateInput(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+
+  if (isValidDateIso(raw)) return raw;
+
+  const dmy = raw.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (dmy) {
+    const iso = `${dmy[3]}-${dmy[2]}-${dmy[1]}`;
+    return isValidDateIso(iso) ? iso : "";
+  }
+
+  const isoDatePrefix = raw.match(/^(\d{4}-\d{2}-\d{2})/);
+  if (isoDatePrefix && isValidDateIso(isoDatePrefix[1])) return isoDatePrefix[1];
+
+  return "";
+}
+
+function inferReleaseDate(source) {
+  const direct = normalizeDateInput(source?.releaseDate || source?.release_date || source?.dataDeLancamento || source?.data_de_lancamento || "");
+  if (direct) return direct;
+
+  const rawYear = Number(source?.year || source?.ano);
+  if (Number.isInteger(rawYear) && rawYear > 0) return `${rawYear}-01-01`;
+  return "";
+}
+
+function formatDatePtBr(isoDate) {
+  const normalized = normalizeDateInput(isoDate);
+  if (!normalized) return "";
+  const date = new Date(`${normalized}T00:00:00Z`);
+  return new Intl.DateTimeFormat("pt-BR", { timeZone: "UTC" }).format(date);
+}
+
+function getReleaseMarkerData(releaseDate, timelineStart, timelineEnd) {
+  const normalized = normalizeDateInput(releaseDate);
+  if (!normalized || !isValidMonth(timelineStart) || !isValidMonth(timelineEnd)) return null;
+  const [year, month, day] = normalized.split("-").map(Number);
+  const monthIso = `${year}-${String(month).padStart(2, "0")}`;
+  const monthIndex = monthToIndex(monthIso);
+  const startIndex = monthToIndex(timelineStart);
+  const endIndex = monthToIndex(timelineEnd);
+  if (monthIndex < startIndex || monthIndex > endIndex) return null;
+
+  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  const dayOffset = Math.max(0, Math.min(day - 1, daysInMonth - 1)) / daysInMonth;
+  const offsetMonths = monthIndex - startIndex + dayOffset;
+
+  return {
+    offsetMonths,
+    label: formatDatePtBr(normalized),
+    short: formatDatePtBr(normalized)
+  };
+}
+
 function uniq(values) {
   return [...new Set(values.filter((v) => String(v || "").trim()))];
 }
@@ -986,8 +1615,8 @@ function renderBarChart(container, map, mode = "vertical", palette = ["#f3ba00"]
         const color = palette[idx % palette.length];
         return `<div class="bar-row">
           <small>${escapeHtml(label)}</small>
+          <strong class="bar-value-start">${value} MESES</strong>
           <div class="bar-row-track"><div class="bar-row-fill" style="width:${(Number(value) / max) * 100}%; background:${color}"></div></div>
-          <strong>${value}</strong>
         </div>`;
       })
       .join("");
@@ -1033,12 +1662,48 @@ function renderDonutChart(container, map) {
   container.innerHTML = `<div class="chart-donut-wrap"><div class="donut" style="background: conic-gradient(${slices})"></div><ul class="legend">${legend}</ul></div>`;
 }
 
-function cardHtml(title, value) {
-  return `<article class="card"><span>${escapeHtml(title)}</span><strong>${escapeHtml(value)}</strong></article>`;
+function summaryIconHtml(icon) {
+  if (icon === "projects") {
+    return `<span class="metric-icon metric-icon-yellow" aria-hidden="true">
+      <svg viewBox="0 0 24 24"><path d="M3 4a1 1 0 0 1 1-1h16a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V4zm2 1v3h3V5H5zm5 0v3h4V5h-4zm6 0v3h3V5h-3zM5 10v4h3v-4H5zm5 0v4h4v-4h-4zm6 0v4h3v-4h-3zM5 16v3h3v-3H5zm5 0v3h4v-3h-4zm6 0v3h3v-3h-3z"/></svg>
+    </span>`;
+  }
+  if (icon === "spent") {
+    return `<span class="metric-icon metric-icon-red" aria-hidden="true">
+      <svg viewBox="0 0 24 24"><path d="M4 6a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v2h1a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2h-1v1a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6zm2 0v14h10V6H6zm12 4v7h1v-7h-1zm-3 3h4v2h-4v-2z"/></svg>
+    </span>`;
+  }
+  return `<span class="metric-icon metric-icon-blue" aria-hidden="true">
+    <svg viewBox="0 0 24 24"><path d="M4 4h2v15h14v2H4V4zm4 9h2v4H8v-4zm4-6h2v10h-2V7zm4 3h2v7h-2v-7z"/></svg>
+  </span>`;
 }
 
-function sortedProjects() {
-  return [...state.projects].sort((a, b) => String(a.code || "").localeCompare(String(b.code || "")));
+function cardHtml(title, value, icon = "projects") {
+  return `<article class="card metric-card">
+    <div class="metric-content">
+      <span>${escapeHtml(title)}</span>
+      <strong>${escapeHtml(value)}</strong>
+    </div>
+    ${summaryIconHtml(icon)}
+  </article>`;
+}
+
+function inlineSelect(field, projectId, currentValue, options, badgeClass = "") {
+  const values = ["", ...options.filter((v) => String(v || "").trim())];
+  const colorKey = field === "category" ? "categories" : field === "format" ? "formats" : field === "nature" ? "natures" : field === "status" ? "statuses" : "";
+  const hexColor = colorKey ? getConfigItemColor(colorKey, currentValue, 0, true) : "";
+  const inlineStyle = hexColor ? ` style="background:${hexToRgba(hexColor, 0.16)};border-color:${hexToRgba(hexColor, 0.45)}"` : "";
+  const cls = `cell-inline-select${field === "status" && !inlineStyle && badgeClass ? ` status-${badgeClass}` : ""}`;
+  return `<select class="${cls}" data-action="inline-select" data-field="${field}" data-id="${projectId}"${inlineStyle}>
+    ${values
+      .map((value) => `<option value="${escapeHtml(value)}" ${String(currentValue || "") === String(value) ? "selected" : ""}>${escapeHtml(value || "—")}</option>`)
+      .join("")}
+  </select>`;
+}
+
+function sortedProjects(list = state.projects, order = "asc") {
+  const sorted = [...list].sort((a, b) => compareSkuDesc(a.code, b.code));
+  return order === "desc" ? sorted : sorted.reverse();
 }
 
 function countBy(projects, picker, ignoreEmpty = false) {
@@ -1053,21 +1718,23 @@ function countBy(projects, picker, ignoreEmpty = false) {
 }
 
 function avgMonthsByStage(projects) {
-  const acc = {};
+  const acc = Object.fromEntries(
+    state.settings.stages
+      .filter((stage) => String(stage?.name || "").trim())
+      .map((stage) => [stage.id, { name: stage.name, total: 0, count: 0 }])
+  );
+
   projects.forEach((p) => {
     p.stages.forEach((s) => {
-      const stage = state.settings.stages.find((st) => st.id === s.stageId);
-      const key = stage?.name || "Etapa";
+      if (!acc[s.stageId] || !isValidMonth(s.start) || !isValidMonth(s.end)) return;
       const months = monthToIndex(s.end) - monthToIndex(s.start) + 1;
-      if (!acc[key]) acc[key] = { total: 0, count: 0 };
-      acc[key].total += months;
-      acc[key].count += 1;
+      if (!Number.isFinite(months) || months <= 0) return;
+      acc[s.stageId].total += months;
+      acc[s.stageId].count += 1;
     });
   });
 
-  return Object.fromEntries(
-    Object.entries(acc).map(([k, v]) => [k, (v.total / v.count).toFixed(1)])
-  );
+  return Object.fromEntries(Object.values(acc).filter((v) => v.count > 0).map((v) => [v.name, (v.total / v.count).toFixed(1)]));
 }
 
 function fillSelect(id, list, selected) {
@@ -1092,6 +1759,7 @@ function monthsBetween(start, end) {
 }
 
 function monthToIndex(value) {
+  if (!isValidMonth(value)) return Number.NaN;
   const [year, month] = value.split("-").map(Number);
   return year * 12 + (month - 1);
 }
@@ -1112,18 +1780,207 @@ function monthLabel(isoMonth) {
   return `${labels[Number(m) - 1]} ${String(y).slice(2)}`;
 }
 
+function monthHoverLabel(isoMonth) {
+  const labels = ["Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"];
+  const [y, m] = isoMonth.split("-");
+  return `${labels[Number(m) - 1]}/${y}`;
+}
+
+function monthLabelLong(isoMonth) {
+  const labels = ["Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"];
+  const [y, m] = isoMonth.split("-");
+  return `${labels[Number(m) - 1]} ${y}`;
+}
+
+function timelineRangeLabel(start, end) {
+  if (!isValidMonth(start) || !isValidMonth(end)) return "";
+  return `${monthLabelLong(start)} — ${monthLabelLong(end)}`;
+}
+
+function isValidMonth(value) {
+  return /^\d{4}-\d{2}$/.test(String(value || ""));
+}
+
 function money(value) {
   return new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL", maximumFractionDigits: 0 }).format(value || 0);
 }
 
 function hasNumericValue(value) {
-  return value !== null && value !== undefined && value !== "" && !Number.isNaN(Number(value));
+  if (value === null || value === undefined) return false;
+  if (typeof value === "string" && value.trim() === "") return false;
+  return !Number.isNaN(Number(value));
+}
+
+function compareSkuDesc(codeA, codeB) {
+  const a = parseSku(codeA);
+  const b = parseSku(codeB);
+  if (a && b) {
+    if (a.prefix !== b.prefix) return b.prefix - a.prefix;
+    return b.number - a.number;
+  }
+  if (a) return -1;
+  if (b) return 1;
+  return String(codeB || "").localeCompare(String(codeA || ""));
+}
+
+function parseSku(code) {
+  const match = String(code || "").trim().match(/^(\d+)-(\d+)$/);
+  if (!match) return null;
+  return { prefix: Number(match[1]), number: Number(match[2]) };
+}
+
+function getTimelineMonthsShown() {
+  const raw = Number(state.timeline?.monthsShown);
+  if (Number.isFinite(raw) && raw > 0) return raw;
+  if (isValidMonth(state.timeline?.start) && isValidMonth(state.timeline?.end)) {
+    const diff = monthToIndex(state.timeline.end) - monthToIndex(state.timeline.start) + 1;
+    if (Number.isFinite(diff) && diff > 0) return diff;
+  }
+  return 24;
+}
+
+function normalizeTimelineWindow() {
+  if (!isValidMonth(state.timeline?.start)) {
+    const def = defaultTimelineWindow();
+    state.timeline.start = def.start;
+  }
+  const months = getTimelineMonthsShown();
+  state.timeline.monthsShown = months;
+  state.timeline.end = addMonths(state.timeline.start, months - 1);
+}
+
+function getProjectSpentValue(project) {
+  const spentCandidate = project?.spent;
+  const budgetCandidate = project?.budget;
+
+  if (hasNumericValue(spentCandidate) && Number(spentCandidate) > 0) return Number(spentCandidate);
+  if (hasNumericValue(budgetCandidate) && Number(budgetCandidate) > 0) return Number(budgetCandidate);
+  return null;
 }
 
 function defaultTimelineWindow() {
   const now = new Date();
   const start = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
-  return { start, end: addMonths(start, 23) };
+  return { start, end: addMonths(start, 23), monthsShown: 24 };
+}
+
+function moveArrayItem(arr, fromIndex, toIndex) {
+  if (!Array.isArray(arr) || fromIndex === toIndex) return;
+  const [item] = arr.splice(fromIndex, 1);
+  arr.splice(toIndex, 0, item);
+}
+
+const DEFAULT_ITEM_COLOR_PALETTES = {
+  categories: ["#f3ba00", "#3b82f6", "#10b981", "#f59e0b", "#8b5cf6", "#06b6d4"],
+  formats: ["#60a5fa", "#34d399", "#f472b6", "#f59e0b", "#a78bfa", "#22c55e"],
+  natures: ["#10b981", "#0ea5e9", "#f97316", "#ef4444", "#8b5cf6", "#14b8a6"],
+  statuses: ["#3b82f6", "#10b981", "#f59e0b", "#94a3b8", "#f97316", "#64748b"]
+};
+
+function normalizeHexColor(value) {
+  const color = String(value || "").trim();
+  if (/^#[0-9a-fA-F]{6}$/.test(color)) return color.toLowerCase();
+  return "";
+}
+
+function buildDefaultItemColors(settings = {}) {
+  return {
+    categories: arrayToColorMap(settings.categories, DEFAULT_ITEM_COLOR_PALETTES.categories),
+    formats: arrayToColorMap(settings.formats, DEFAULT_ITEM_COLOR_PALETTES.formats),
+    natures: arrayToColorMap(settings.natures, DEFAULT_ITEM_COLOR_PALETTES.natures),
+    statuses: arrayToColorMap(settings.statuses, DEFAULT_ITEM_COLOR_PALETTES.statuses)
+  };
+}
+
+function arrayToColorMap(items = [], palette = []) {
+  const list = Array.isArray(items) ? items : [];
+  const map = {};
+  list.forEach((item, index) => {
+    const name = String(item || "").trim();
+    if (!name) return;
+    map[name] = palette[index % palette.length] || randomColor();
+  });
+  return map;
+}
+
+function mergeItemColors(defaults = {}, incoming = {}) {
+  const output = {};
+  Object.keys(defaults).forEach((key) => {
+    output[key] = { ...defaults[key] };
+    const source = incoming?.[key] && typeof incoming[key] === "object" ? incoming[key] : {};
+    Object.entries(source).forEach(([name, color]) => {
+      const normalized = normalizeHexColor(color);
+      if (normalized) output[key][name] = normalized;
+    });
+  });
+  return output;
+}
+
+function getConfigItemColor(key, label, index = 0, strict = false) {
+  if (!COLOR_CONFIG_KEYS.has(key)) return "";
+  const cleanLabel = String(label || "").trim();
+  const existing = normalizeHexColor(state.settings?.itemColors?.[key]?.[cleanLabel]);
+  if (existing) return existing;
+  if (strict) return "";
+  const palette = DEFAULT_ITEM_COLOR_PALETTES[key] || [];
+  return palette[index % palette.length] || randomColor();
+}
+
+function setConfigItemColor(key, label, color) {
+  if (!COLOR_CONFIG_KEYS.has(key)) return;
+  const cleanLabel = String(label || "").trim();
+  const normalized = normalizeHexColor(color);
+  if (!cleanLabel || !normalized) return;
+  if (!state.settings.itemColors || typeof state.settings.itemColors !== "object") {
+    state.settings.itemColors = buildDefaultItemColors(state.settings);
+  }
+  if (!state.settings.itemColors[key]) state.settings.itemColors[key] = {};
+  state.settings.itemColors[key][cleanLabel] = normalized;
+}
+
+function deleteConfigItemColor(key, label) {
+  const cleanLabel = String(label || "").trim();
+  if (!cleanLabel || !COLOR_CONFIG_KEYS.has(key)) return;
+  if (!state.settings?.itemColors?.[key]) return;
+  delete state.settings.itemColors[key][cleanLabel];
+}
+
+function renameConfigItemColor(key, oldLabel, newLabel, index = 0) {
+  if (!COLOR_CONFIG_KEYS.has(key)) return;
+  const oldName = String(oldLabel || "").trim();
+  const newName = String(newLabel || "").trim();
+  if (!newName) return;
+  const previous = getConfigItemColor(key, oldName, index);
+  deleteConfigItemColor(key, oldName);
+  setConfigItemColor(key, newName, previous);
+}
+
+function buildItemColorMap(rows = [], items = [], fallbackPalette = []) {
+  const byName = {};
+  rows.forEach((row) => {
+    const name = String(row?.name || "").trim();
+    if (!name) return;
+    const rawColor = String(row?.color || "").trim();
+    const normalized = normalizeHexColor(rawColor) || (rawColor ? normalizeHexColor(colorKeyToHex(rawColor)) : "");
+    if (normalized) byName[name] = normalized;
+  });
+
+  const map = {};
+  items.forEach((name, index) => {
+    const key = String(name || "").trim();
+    if (!key) return;
+    map[key] = byName[key] || fallbackPalette[index % fallbackPalette.length] || randomColor();
+  });
+  return map;
+}
+
+function hexToRgba(hex, alpha = 1) {
+  const normalized = normalizeHexColor(hex);
+  if (!normalized) return "";
+  const r = Number.parseInt(normalized.slice(1, 3), 16);
+  const g = Number.parseInt(normalized.slice(3, 5), 16);
+  const b = Number.parseInt(normalized.slice(5, 7), 16);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
 
 function nextCode() {
@@ -1157,42 +2014,97 @@ function escapeHtml(str) {
 }
 
 function saveState() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  const serialized = JSON.stringify(state);
+  localStorage.setItem(STORAGE_KEY, serialized);
+  localStorage.setItem(`${STORAGE_KEY}_backup`, serialized);
 }
 
 function loadState() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return seedState();
-    const parsed = JSON.parse(raw);
-    return mergeState(parsed);
-  } catch {
-    return seedState();
+  const primary = loadStateFromKey(STORAGE_KEY);
+  if (primary) return primary;
+
+  for (const key of STORAGE_FALLBACK_KEYS) {
+    const recovered = loadStateFromKey(key);
+    if (recovered) {
+      console.warn(`[Originais] Estado recuperado de '${key}'.`);
+      if (key !== STORAGE_KEY) {
+        const serialized = JSON.stringify(recovered);
+        localStorage.setItem(STORAGE_KEY, serialized);
+        localStorage.setItem(`${STORAGE_KEY}_backup`, serialized);
+      }
+      return recovered;
+    }
   }
+
+  console.warn("[Originais] Nenhum estado válido encontrado no localStorage. Carregando seed.");
+  return seedState();
+}
+
+function loadStateFromKey(key) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    const merged = mergeState(parsed);
+    if (!Array.isArray(merged?.projects)) return null;
+    return merged;
+  } catch (error) {
+    console.warn(`[Originais] Falha ao carregar localStorage '${key}'.`, error);
+    return null;
+  }
+}
+
+function pickArray(value, fallback) {
+  if (Array.isArray(value) && value.length) return value;
+  return Array.isArray(fallback) ? fallback : [];
 }
 
 function mergeState(parsed) {
   const base = seedState();
+  const mergedSettings = {
+    categories: pickArray(parsed?.settings?.categories, base.settings.categories),
+    productionTypes: pickArray(parsed?.settings?.productionTypes, base.settings.productionTypes),
+    formats: pickArray(parsed?.settings?.formats, base.settings.formats),
+    natures: pickArray(parsed?.settings?.natures, base.settings.natures),
+    durations: pickArray(parsed?.settings?.durations, base.settings.durations),
+    statuses: pickArray(parsed?.settings?.statuses, base.settings.statuses),
+    stages: pickArray(parsed?.settings?.stages, base.settings.stages)
+  };
+  mergedSettings.itemColors = mergeItemColors(buildDefaultItemColors(mergedSettings), parsed?.settings?.itemColors || base.settings.itemColors);
+
+  const sourceProjects = Array.isArray(parsed?.projects) ? parsed.projects.filter((p) => p && typeof p === "object") : base.projects;
+  const projects = sourceProjects.map((project) => ({
+    ...project,
+    releaseDate: inferReleaseDate(project)
+  }));
+
   return {
-    settings: {
-      categories: parsed?.settings?.categories?.length ? parsed.settings.categories : base.settings.categories,
-      productionTypes: parsed?.settings?.productionTypes?.length ? parsed.settings.productionTypes : base.settings.productionTypes,
-      formats: parsed?.settings?.formats?.length ? parsed.settings.formats : base.settings.formats,
-      natures: parsed?.settings?.natures?.length ? parsed.settings.natures : base.settings.natures,
-      durations: parsed?.settings?.durations?.length ? parsed.settings.durations : base.settings.durations,
-      statuses: parsed?.settings?.statuses?.length ? parsed.settings.statuses : base.settings.statuses,
-      stages: parsed?.settings?.stages?.length ? parsed.settings.stages : base.settings.stages
-    },
-    projects: Array.isArray(parsed?.projects) ? parsed.projects : base.projects,
+    settings: mergedSettings,
+    projects,
     timeline: {
       start: parsed?.timeline?.start || defaultTimelineWindow().start,
-      end: parsed?.timeline?.end || defaultTimelineWindow().end
+      end: parsed?.timeline?.end || defaultTimelineWindow().end,
+      monthsShown:
+        parsed?.timeline?.monthsShown ||
+        (isValidMonth(parsed?.timeline?.start) && isValidMonth(parsed?.timeline?.end)
+          ? monthToIndex(parsed.timeline.end) - monthToIndex(parsed.timeline.start) + 1
+          : defaultTimelineWindow().monthsShown)
     }
   };
 }
 
 function seedState() {
-  if (window.BASE44_SEED?.projects?.length) return structuredClone(window.BASE44_SEED);
+  if (window.BASE44_SEED?.projects?.length) {
+    const cloned = structuredClone(window.BASE44_SEED);
+    cloned.settings = cloned.settings || {};
+    cloned.projects = (cloned.projects || []).map((project) => ({
+      ...project,
+      releaseDate: inferReleaseDate(project)
+    }));
+    const defaults = buildDefaultItemColors(cloned.settings);
+    cloned.settings.itemColors = mergeItemColors(defaults, cloned.settings.itemColors);
+    return cloned;
+  }
 
   const stages = [
     { id: uid(), name: "Desenvolvimento", color: "#34d399" },
@@ -1239,7 +2151,29 @@ function seedState() {
       natures: ["Documental", "Ficção", "Animação"],
       durations: ["Média-metragem", "Curta-metragem", "Longa-metragem"],
       statuses: ["Em andamento", "Concluído", "Planejamento", "Pausado"],
-      stages
+      stages,
+      itemColors: {
+        categories: {
+          Streaming: "#f3ba00",
+          Produtora: "#3b82f6",
+          Incubado: "#10b981"
+        },
+        formats: {
+          "Obra Não Seriada": "#60a5fa",
+          Série: "#34d399"
+        },
+        natures: {
+          Documental: "#0ea5e9",
+          Ficção: "#10b981",
+          Animação: "#f97316"
+        },
+        statuses: {
+          "Em andamento": "#3b82f6",
+          Concluído: "#10b981",
+          Planejamento: "#f59e0b",
+          Pausado: "#94a3b8"
+        }
+      }
     },
     projects,
     timeline: {
@@ -1249,7 +2183,23 @@ function seedState() {
 }
 
 function projectSeed(code, title, year, category, format, nature, duration, status, budget, stages) {
-  return { id: uid(), code, title, year, category, productionType: "", format, nature, duration, status, budget, spent: 0, notes: "", stages };
+  return {
+    id: uid(),
+    code,
+    title,
+    year,
+    category,
+    productionType: "",
+    format,
+    nature,
+    duration,
+    status,
+    budget,
+    releaseDate: "",
+    spent: 0,
+    notes: "",
+    stages
+  };
 }
 
 function stageSeed(stageId, start, end) {
